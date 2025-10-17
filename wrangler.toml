@@ -1,0 +1,20 @@
+name = "ffxiv-market-search"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Cloudflare Workers の設定
+account_id = "" # wrangler login 後に自動設定されます
+
+# 環境変数
+[vars]
+DEFAULT_WORLD = "Elemental"
+CACHE_TTL = "60"
+
+# オプション: XIVAPI APIキー（レート制限緩和用）
+# XIVAPI_KEY を設定する場合は以下のコマンドを使用:
+# wrangler secret put XIVAPI_KEY
+
+# Workers のリソース制限（無料枠）
+# - CPU時間: 10ms / リクエスト
+# - メモリ: 128MB
+# - リクエスト数: 100,000 / 日
