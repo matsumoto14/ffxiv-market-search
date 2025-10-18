@@ -3,12 +3,14 @@
 
 const DEFAULT_WORLD = 'Elemental'; // デフォルトワールド
 const CACHE_TTL = 60; // キャッシュTTL（秒）
-const XIVAPI_BASE = 'https://xivapi.com';
+const XIVAPI_BASE = 'https://v2.xivapi.com/api'; // XIVAPI v2
 const UNIVERSALIS_BASE = 'https://universalis.app/api/v2';
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
+export default {
+  async fetch(request, env, ctx) {
+    return handleRequest(request, env, ctx);
+  }
+};
 
 async function handleRequest(request) {
   const url = new URL(request.url);
@@ -22,6 +24,13 @@ async function handleRequest(request) {
         'Access-Control-Allow-Headers': 'Content-Type',
       }
     });
+  }
+
+  // Font file serving
+  if (url.pathname === '/FFXIV_Lodestone_SSF.woff') {
+    // フォントファイルはbase64エンコードして埋め込むか、外部URLを使用
+    // ここでは簡易的にリダイレクト
+    return new Response('Font not available in dev mode', { status: 404 });
   }
 
   // API endpoint
@@ -45,7 +54,8 @@ async function handleRequest(request) {
 async function handleSearch(url) {
   const params = url.searchParams;
   const q = params.get('q')?.trim();
-  const world = params.get('world')?.trim() || DEFAULT_WORLD;
+  const worldParam = params.get('world')?.trim();
+  const world = worldParam || ''; // 空の場合は全検索（Universalis側で処理）
   const hq = params.get('hq') === 'true';
   const minPrice = parseInt(params.get('min_price') || '0', 10);
   const maxPrice = parseInt(params.get('max_price') || '999999999', 10);
@@ -73,13 +83,13 @@ async function handleSearch(url) {
 
   try {
     // XIVAPI でアイテムID検索
-    const itemId = await searchItemId(q);
-    if (!itemId) {
+    const itemResult = await searchItemId(q);
+    if (!itemResult) {
       return jsonResponse({ error: 'item_not_found', message: `アイテム "${q}" が見つかりませんでした` }, 404);
     }
 
     // Universalis でマーケット情報取得
-    const marketData = await fetchMarketData(world, itemId);
+    const marketData = await fetchMarketData(world, itemResult.id);
 
     // データ整形
     const listings = (marketData.listings || [])
@@ -101,8 +111,8 @@ async function handleSearch(url) {
     const result = {
       query: q,
       world,
-      itemId,
-      itemName: marketData.itemName || q,
+      itemId: itemResult.id,
+      itemName: marketData.itemName || itemResult.name,
       total: listings.length,
       page,
       perPage,
@@ -112,7 +122,16 @@ async function handleSearch(url) {
         hq: l.hq,
         total: l.total,
         retainerName: l.retainerName,
+        worldName: l.worldName,
         lastReviewTime: l.lastReviewTime,
+      })),
+      recentHistory: (marketData.recentHistory || []).slice(0, 10).map(h => ({
+        price: h.pricePerUnit,
+        quantity: h.quantity,
+        hq: h.hq,
+        buyerName: h.buyerName,
+        worldName: h.worldName,
+        timestamp: h.timestamp,
       })),
       cheapest: paginatedListings.length > 0 ? paginatedListings[0].pricePerUnit : null,
       averagePrice: marketData.averagePrice || null,
@@ -140,18 +159,42 @@ async function handleSearch(url) {
 }
 
 async function searchItemId(query) {
-  const apiKey = typeof XIVAPI_KEY !== 'undefined' ? XIVAPI_KEY : '';
-  const url = `${XIVAPI_BASE}/search?indexes=item&string=${encodeURIComponent(query)}&limit=1${apiKey ? `&private_key=${apiKey}` : ''}`;
+  // XIVAPI v2のキーワード検索を使用
+  // Name~"keyword" で部分一致検索
+  const searchQuery = `Name~"${query}"`;
+  const url = `${XIVAPI_BASE}/search?sheets=Item&fields=Name,ItemUICategory.Name,Icon&language=ja&query=${encodeURIComponent(searchQuery)}&limit=10`;
 
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`XIVAPI error: ${response.status}`);
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'FFXIV-Market-Search/1.0',
+      'Accept': 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`XIVAPI error: ${response.status}`);
+  }
 
   const data = await response.json();
-  return data.Results?.[0]?.ID || null;
+
+  // v2のレスポンス形式: { results: [{ row_id, fields: { Name, ... } }] }
+  if (data.results && data.results.length > 0) {
+    // 最初のマッチを返す
+    const item = data.results[0];
+    return {
+      id: item.row_id,
+      name: item.fields?.Name || query
+    };
+  }
+
+  return null;
 }
 
 async function fetchMarketData(world, itemId) {
-  const url = `${UNIVERSALIS_BASE}/${encodeURIComponent(world)}/${itemId}`;
+  // ワールドが指定されていない場合は日本全DCを検索
+  const searchWorld = world || 'Japan';
+  // entries=10 で取引履歴を10件取得
+  const url = `${UNIVERSALIS_BASE}/${encodeURIComponent(searchWorld)}/${itemId}?entries=10`;
 
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Universalis error: ${response.status}`);
@@ -160,6 +203,7 @@ async function fetchMarketData(world, itemId) {
   return {
     itemName: data.itemName || data.name,
     listings: data.listings || [],
+    recentHistory: data.recentHistory || [],
     averagePrice: data.averagePrice,
   };
 }
@@ -190,536 +234,656 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     :root {
       --primary: #3b82f6;
-      --primary-dark: #2563eb;
+      --primary-hover: #2563eb;
       --bg: #f8fafc;
-      --card-bg: #ffffff;
+      --sidebar-bg: #ffffff;
       --text: #1e293b;
       --text-muted: #64748b;
       --border: #e2e8f0;
-      --error: #ef4444;
-      --success: #10b981;
-      --warning: #f59e0b;
+      --hover-bg: #f1f5f9;
+      --selected-bg: #dbeafe;
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.6;
-      padding: 16px;
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
     }
 
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
+    .header {
+      background: var(--sidebar-bg);
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
 
     h1 {
-      font-size: 1.75rem;
-      margin-bottom: 24px;
-      text-align: center;
+      font-size: 1.5rem;
+      margin: 0;
     }
 
-    .search-form {
-      background: var(--card-bg);
-      padding: 24px;
-      border-radius: 12px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-      margin-bottom: 24px;
+    .header-right {
+      display: flex;
+      gap: 12px;
+      align-items: center;
     }
 
-    .form-group {
-      margin-bottom: 16px;
+    .header-right select {
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
+      background: white;
+      cursor: pointer;
+      min-width: 150px;
     }
 
-    label {
-      display: block;
-      font-weight: 600;
-      margin-bottom: 6px;
-      font-size: 0.9rem;
-    }
-
-    input, select, button {
-      width: 100%;
-      padding: 12px 14px;
-      font-size: 1rem;
-      border: 2px solid var(--border);
-      border-radius: 8px;
-      transition: border-color 0.2s;
-    }
-
-    input:focus, select:focus {
+    .header-right select:focus {
       outline: none;
       border-color: var(--primary);
     }
 
-    .form-row {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: 1fr;
+    .header-right label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
     }
 
-    @media (min-width: 640px) {
-      .form-row {
-        grid-template-columns: 1fr 1fr;
-      }
-      .form-row-3 {
-        grid-template-columns: 1fr 1fr 1fr;
-      }
-    }
-
-    .checkbox-group {
+    .main-container {
       display: flex;
-      align-items: center;
-      gap: 8px;
+      flex: 1;
+      overflow: hidden;
     }
 
-    .checkbox-group input[type="checkbox"] {
-      width: auto;
-      margin: 0;
+    .sidebar {
+      width: 320px;
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
 
-    button {
-      background: var(--primary);
-      color: white;
-      border: none;
-      font-weight: 600;
-      cursor: pointer;
-      margin-top: 8px;
-      transition: background 0.2s;
+    .search-box {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
     }
 
-    button:hover {
-      background: var(--primary-dark);
-    }
-
-    button:disabled {
-      background: var(--text-muted);
-      cursor: not-allowed;
-    }
-
-    .status-badge {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 12px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      margin-bottom: 12px;
-    }
-
-    .badge-cache { background: #dbeafe; color: #1e40af; }
-    .badge-fresh { background: #d1fae5; color: #065f46; }
-    .badge-hq { background: #fef3c7; color: #92400e; }
-
-    .results {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: 1fr;
-    }
-
-    @media (min-width: 768px) {
-      .results {
-        grid-template-columns: 1fr 1fr;
-      }
-    }
-
-    .card {
-      background: var(--card-bg);
-      border-radius: 12px;
-      padding: 20px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    .search-box input {
+      width: 100%;
+      padding: 10px 12px;
       border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
     }
 
-    .card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 12px;
+    .search-box input:focus {
+      outline: none;
+      border-color: var(--primary);
     }
 
-    .card-title {
+
+    .item-list {
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    .item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .item:hover {
+      background: var(--hover-bg);
+    }
+
+    .item.selected {
+      background: var(--selected-bg);
+      border-left: 3px solid var(--primary);
+    }
+
+    .item-name {
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+
+    .item-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .content-header {
+      margin-bottom: 24px;
+    }
+
+    .content-title {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .content-meta {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    .section {
+      margin-bottom: 32px;
+    }
+
+    .section-title {
       font-size: 1.1rem;
       font-weight: 600;
-    }
-
-    .price {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--primary);
-      margin: 8px 0;
-    }
-
-    .card-meta {
-      color: var(--text-muted);
-      font-size: 0.85rem;
       margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
     }
 
-    .detail-btn {
-      padding: 8px 16px;
-      font-size: 0.9rem;
-      width: auto;
-      margin-top: 8px;
-    }
-
-    .loading, .error, .empty {
-      text-align: center;
-      padding: 48px 24px;
-      background: var(--card-bg);
-      border-radius: 12px;
-    }
-
-    .loading {
-      color: var(--text-muted);
-    }
-
-    .error {
-      color: var(--error);
-    }
-
-    .skeleton {
-      background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
-      background-size: 200% 100%;
-      animation: loading 1.5s infinite;
-      border-radius: 8px;
-      height: 20px;
-      margin-bottom: 12px;
-    }
-
-    @keyframes loading {
-      0% { background-position: 200% 0; }
-      100% { background-position: -200% 0; }
-    }
-
-    .modal {
-      display: none;
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background: rgba(0,0,0,0.6);
-      z-index: 1000;
-      padding: 16px;
-      overflow-y: auto;
-    }
-
-    .modal.active {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .modal-content {
-      background: var(--card-bg);
-      border-radius: 12px;
-      padding: 24px;
-      max-width: 600px;
+    table {
       width: 100%;
-      max-height: 90vh;
-      overflow-y: auto;
-      position: relative;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
 
-    .modal-close {
-      position: absolute;
-      top: 16px;
-      right: 16px;
-      background: transparent;
-      color: var(--text-muted);
-      border: none;
-      font-size: 1.5rem;
-      cursor: pointer;
-      width: auto;
-      padding: 4px 12px;
+    th {
+      background: var(--hover-bg);
+      padding: 12px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 13px;
+      border-bottom: 2px solid var(--border);
     }
 
-    .listing-item {
+    td {
+      padding: 12px;
       border-bottom: 1px solid var(--border);
-      padding: 12px 0;
+      font-size: 14px;
     }
 
-    .listing-item:last-child {
+    tr:last-child td {
       border-bottom: none;
     }
 
-    .relative-time {
+    tr:hover {
+      background: var(--hover-bg);
+    }
+
+    .price {
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .badge-hq {
+      display: inline-block;
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      color: white;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 3px;
+      vertical-align: middle;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
       color: var(--text-muted);
-      font-size: 0.8rem;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 24px;
+      color: var(--text-muted);
+    }
+
+    .table-wrapper {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* モバイル対応 */
+    @media (max-width: 768px) {
+      .header {
+        flex-direction: column;
+        gap: 12px;
+        align-items: stretch;
+      }
+
+      h1 {
+        font-size: 1.25rem;
+      }
+
+      .header-right {
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .header-right select {
+        width: 100%;
+      }
+
+      .main-container {
+        flex-direction: column;
+      }
+
+      .sidebar {
+        width: 100%;
+        max-height: 40vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .content {
+        padding: 16px;
+      }
+
+      .content-title {
+        font-size: 1.1rem;
+      }
+
+      .section-title {
+        font-size: 1rem;
+      }
+
+      table {
+        font-size: 12px;
+      }
+
+      th, td {
+        padding: 8px 6px;
+      }
+
+      .item {
+        padding: 10px 12px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .header {
+        padding: 12px 16px;
+      }
+
+      .content {
+        padding: 12px;
+      }
+
+      h1 {
+        font-size: 1.1rem;
+      }
+
+      table {
+        font-size: 11px;
+      }
+
+      th, td {
+        padding: 6px 4px;
+      }
+
+      .badge-hq {
+        font-size: 10px;
+        padding: 1px 4px;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="header">
     <h1>FFXIV マーケット検索</h1>
-
-    <form class="search-form" id="searchForm" role="search">
-      <div class="form-group">
-        <label for="query">アイテム名</label>
-        <input
-          type="text"
-          id="query"
-          name="query"
-          placeholder="例: Megapotion"
-          required
-          aria-required="true"
-        >
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label for="world">ワールド</label>
-          <input
-            type="text"
-            id="world"
-            name="world"
-            placeholder="未指定（デフォルト: Elemental）"
-            list="worldList"
-          >
-          <datalist id="worldList">
-            <option value="Elemental">
-            <option value="Gaia">
-            <option value="Mana">
-            <option value="Meteor">
-            <option value="Carbuncle">
-            <option value="Tonberry">
-            <option value="Kujata">
-          </datalist>
-        </div>
-
-        <div class="form-group">
-          <label for="sort">並び順</label>
-          <select id="sort" name="sort">
-            <option value="price_asc">価格が安い順</option>
-            <option value="price_desc">価格が高い順</option>
-            <option value="recent">最近の更新順</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="form-row form-row-3">
-        <div class="form-group">
-          <label for="minPrice">最低価格</label>
-          <input type="number" id="minPrice" name="minPrice" placeholder="0">
-        </div>
-
-        <div class="form-group">
-          <label for="maxPrice">最高価格</label>
-          <input type="number" id="maxPrice" name="maxPrice" placeholder="無制限">
-        </div>
-
-        <div class="form-group">
-          <label class="checkbox-group">
-            <input type="checkbox" id="hq" name="hq">
-            <span>HQ のみ</span>
-          </label>
-        </div>
-      </div>
-
-      <button type="submit" id="searchBtn">検索</button>
-    </form>
-
-    <div id="results" role="region" aria-live="polite"></div>
+    <div class="header-right">
+      <label>データセンター:</label>
+      <select id="dcSelect">
+        <option value="">全エリア</option>
+      </select>
+      <label>ワールド:</label>
+      <select id="worldSelect">
+        <option value="">全ワールド</option>
+      </select>
+    </div>
   </div>
 
-  <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-    <div class="modal-content">
-      <button class="modal-close" aria-label="閉じる">&times;</button>
-      <h2 id="modalTitle">出品詳細</h2>
-      <div id="modalBody"></div>
+  <div class="main-container">
+    <div class="sidebar">
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="アイテム名で検索..." />
+      </div>
+      <div class="item-list" id="itemList">
+        <div class="empty-state">アイテムを検索してください</div>
+      </div>
+    </div>
+
+    <div class="content" id="content">
+      <div class="empty-state">
+        左側のリストからアイテムを選択してください
+      </div>
     </div>
   </div>
 
   <script>
-    const form = document.getElementById('searchForm');
-    const resultsDiv = document.getElementById('results');
-    const modal = document.getElementById('modal');
-    const modalBody = document.getElementById('modalBody');
-    const modalTitle = document.getElementById('modalTitle');
-    let currentData = null;
+    let searchResults = [];
+    let selectedItem = null;
+    let debounceTimer = null;
+    let worldData = { dataCenters: [], worlds: [] };
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      await performSearch();
-    });
+    const searchInput = document.getElementById('searchInput');
+    const dcSelect = document.getElementById('dcSelect');
+    const worldSelect = document.getElementById('worldSelect');
+    const itemList = document.getElementById('itemList');
+    const content = document.getElementById('content');
 
-    // キーボードでモーダルを閉じる
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && modal.classList.contains('active')) {
-        closeModal();
-      }
-    });
-
-    // 背景クリックでモーダルを閉じる
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) {
-        closeModal();
-      }
-    });
-
-    async function performSearch() {
-      const formData = new FormData(form);
-      const query = formData.get('query')?.trim();
-
-      if (!query) {
-        showError('アイテム名を入力してください');
-        return;
-      }
-
-      const params = new URLSearchParams({
-        q: query,
-        world: formData.get('world') || '',
-        hq: document.getElementById('hq').checked,
-        min_price: formData.get('minPrice') || '',
-        max_price: formData.get('maxPrice') || '',
-        sort: formData.get('sort') || 'price_asc',
-      });
-
-      showLoading();
-
+    // 初期化：ワールド/DCデータを取得
+    (async function init() {
       try {
-        const response = await fetch(\`/api/search?\${params}\`);
+        const response = await fetch('https://v2.xivapi.com/api/sheet/World?fields=Name,DataCenter.Name,Region,IsPublic&language=ja&limit=400');
         const data = await response.json();
 
-        if (!response.ok) {
-          showError(data.message || 'エラーが発生しました');
-          return;
-        }
+        // IsPublic=trueのワールドのみ抽出
+        const publicWorlds = data.rows
+          .filter(r => r.fields.IsPublic === true)
+          .map(r => ({
+            name: r.fields.Name,
+            dc: r.fields.DataCenter.fields.Name
+          }));
 
-        currentData = data;
-        const cacheStatus = response.headers.get('X-Cache');
-        displayResults(data, cacheStatus);
+        // データセンターリストを作成（重複除去）
+        const dcSet = new Set(publicWorlds.map(w => w.dc));
+        worldData.dataCenters = Array.from(dcSet).sort();
+        worldData.worlds = publicWorlds;
+
+        // データセンタープルダウンを設定
+        worldData.dataCenters.forEach(dc => {
+          const option = document.createElement('option');
+          option.value = dc;
+          option.textContent = dc;
+          dcSelect.appendChild(option);
+        });
+
       } catch (error) {
-        showError('通信エラーが発生しました');
+        console.error('Failed to load world data:', error);
       }
-    }
+    })();
 
-    function showLoading() {
-      resultsDiv.innerHTML = \`
-        <div class="loading">
-          <div class="skeleton"></div>
-          <div class="skeleton" style="width: 80%; margin: 0 auto 12px;"></div>
-          <div class="skeleton" style="width: 60%; margin: 0 auto;"></div>
-          <p style="margin-top: 16px;">検索中...</p>
-        </div>
-      \`;
-    }
+    // データセンター選択時にワールドを絞り込み
+    dcSelect.addEventListener('change', () => {
+      const selectedDC = dcSelect.value;
+      worldSelect.innerHTML = '<option value="">全ワールド</option>';
 
-    function showError(message) {
-      resultsDiv.innerHTML = \`
-        <div class="error">
-          <h3>⚠️ エラー</h3>
-          <p>\${escapeHtml(message)}</p>
-        </div>
-      \`;
-    }
-
-    function displayResults(data, cacheStatus) {
-      if (!data.listings || data.listings.length === 0) {
-        resultsDiv.innerHTML = \`
-          <div class="empty">
-            <h3>該当なし</h3>
-            <p>「\${escapeHtml(data.query)}」の検索結果が見つかりませんでした</p>
-            <p style="color: var(--text-muted); margin-top: 8px;">
-              フィルタ条件を変更してみてください
-            </p>
-          </div>
-        \`;
-        return;
-      }
-
-      const cacheLabel = cacheStatus === 'HIT'
-        ? '<span class="status-badge badge-cache">キャッシュ</span>'
-        : '<span class="status-badge badge-fresh">最新取得</span>';
-
-      let html = \`
-        <div style="margin-bottom: 16px; text-align: center;">
-          \${cacheLabel}
-          <p style="color: var(--text-muted); font-size: 0.9rem;">
-            \${data.total} 件の出品 | \${escapeHtml(data.itemName)} @ \${escapeHtml(data.world)}
-          </p>
-        </div>
-        <div class="results">
-      \`;
-
-      data.listings.forEach((listing, idx) => {
-        const relativeTime = formatRelativeTime(listing.lastReviewTime);
-        html += \`
-          <div class="card">
-            <div class="card-header">
-              <div class="card-title">\${escapeHtml(data.itemName)}</div>
-              \${listing.hq ? '<span class="status-badge badge-hq">HQ</span>' : ''}
-            </div>
-            <div class="price">\${listing.price.toLocaleString()} Gil</div>
-            <div class="card-meta">
-              在庫: \${listing.quantity} 個 | 合計: \${listing.total.toLocaleString()} Gil
-            </div>
-            <div class="relative-time">\${relativeTime}</div>
-            <button class="detail-btn" onclick="showDetails(\${idx})">詳細を見る</button>
-          </div>
-        \`;
-      });
-
-      html += '</div>';
-      resultsDiv.innerHTML = html;
-    }
-
-    function showDetails(index) {
-      if (!currentData || !currentData.listings[index]) return;
-
-      const listing = currentData.listings[index];
-      modalTitle.textContent = \`\${currentData.itemName} の出品詳細\`;
-
-      modalBody.innerHTML = \`
-        <div class="listing-item">
-          <p><strong>価格:</strong> \${listing.price.toLocaleString()} Gil</p>
-          <p><strong>数量:</strong> \${listing.quantity}</p>
-          <p><strong>合計:</strong> \${listing.total.toLocaleString()} Gil</p>
-          <p><strong>品質:</strong> \${listing.hq ? 'HQ' : 'NQ'}</p>
-          <p><strong>リテイナー:</strong> \${escapeHtml(listing.retainerName || '不明')}</p>
-          <p class="relative-time">最終確認: \${formatRelativeTime(listing.lastReviewTime)}</p>
-        </div>
-      \`;
-
-      // 周辺の出品も表示（上位3件）
-      const nearby = currentData.listings.slice(0, 3).filter((_, i) => i !== index);
-      if (nearby.length > 0) {
-        modalBody.innerHTML += '<h3 style="margin-top: 20px; margin-bottom: 12px;">他の出品</h3>';
-        nearby.forEach(l => {
-          modalBody.innerHTML += \`
-            <div class="listing-item">
-              <p><strong>\${l.price.toLocaleString()} Gil</strong> × \${l.quantity} \${l.hq ? '(HQ)' : ''}</p>
-              <p class="relative-time">\${formatRelativeTime(l.lastReviewTime)}</p>
-            </div>
-          \`;
+      if (selectedDC) {
+        const filteredWorlds = worldData.worlds.filter(w => w.dc === selectedDC);
+        filteredWorlds.forEach(w => {
+          const option = document.createElement('option');
+          option.value = w.name;
+          option.textContent = w.name;
+          worldSelect.appendChild(option);
+        });
+      } else {
+        // 全エリア選択時は全ワールド表示
+        worldData.worlds.forEach(w => {
+          const option = document.createElement('option');
+          option.value = w.name;
+          option.textContent = \`\${w.name} (\${w.dc})\`;
+          worldSelect.appendChild(option);
         });
       }
 
-      modal.classList.add('active');
+      // 選択中のアイテムがあれば再検索
+      if (selectedItem) {
+        loadMarketData();
+      }
+    });
+
+    // ワールド選択時に再検索
+    worldSelect.addEventListener('change', () => {
+      if (selectedItem) {
+        loadMarketData();
+      }
+    });
+
+    // 検索入力のデバウンス
+    searchInput.addEventListener('input', () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        const query = searchInput.value.trim();
+        if (query.length >= 2) {
+          searchItems(query);
+        } else {
+          itemList.innerHTML = '<div class="empty-state">2文字以上入力してください</div>';
+          searchResults = [];
+        }
+      }, 300);
+    });
+
+    // アイテム検索
+    async function searchItems(query) {
+      itemList.innerHTML = '<div class="loading">検索中...</div>';
+
+      try {
+        const url = \`https://v2.xivapi.com/api/search?sheets=Item&fields=Name,ItemUICategory.Name,Icon&language=ja&query=Name~"\${encodeURIComponent(query)}"&limit=50\`;
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.results && data.results.length > 0) {
+          searchResults = data.results.map(r => {
+            // Icon.id から URL を生成
+            let iconUrl = '';
+            if (r.fields.Icon && r.fields.Icon.id) {
+              const iconId = r.fields.Icon.id;
+              const folder = String(Math.floor(iconId / 1000) * 1000).padStart(6, '0');
+              const file = String(iconId).padStart(6, '0');
+              iconUrl = \`https://xivapi.com/i/\${folder}/\${file}.png\`;
+            }
+
+            return {
+              id: r.row_id,
+              name: r.fields.Name,
+              category: r.fields.ItemUICategory?.Name || '不明',
+              iconUrl: iconUrl
+            };
+          });
+          displayItemList();
+        } else {
+          itemList.innerHTML = '<div class="empty-state">該当なし</div>';
+          searchResults = [];
+        }
+      } catch (error) {
+        itemList.innerHTML = '<div class="empty-state">エラーが発生しました</div>';
+        console.error('Search error:', error);
+      }
     }
 
-    function closeModal() {
-      modal.classList.remove('active');
+    // アイテムリスト表示
+    function displayItemList() {
+      itemList.innerHTML = searchResults.map((item, idx) => {
+        return \`
+          <div class="item \${selectedItem && selectedItem.id === item.id ? 'selected' : ''}" onclick="selectItem(\${idx})">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              \${item.iconUrl ? \`<img src="\${item.iconUrl}" alt="" style="width: 32px; height: 32px; flex-shrink: 0;">\` : ''}
+              <div style="flex: 1; min-width: 0;">
+                <div class="item-name">\${escapeHtml(item.name)}</div>
+                <div class="item-meta">\${escapeHtml(item.category)}</div>
+              </div>
+            </div>
+          </div>
+        \`;
+      }).join('');
     }
 
-    function formatRelativeTime(timestamp) {
-      const now = Date.now();
-      const diff = Math.floor((now - timestamp) / 1000);
+    // アイテム選択
+    async function selectItem(index) {
+      selectedItem = searchResults[index];
+      displayItemList();
+      await loadMarketData();
+    }
 
-      if (diff < 60) return \`\${diff}秒前\`;
-      if (diff < 3600) return \`\${Math.floor(diff / 60)}分前\`;
-      if (diff < 86400) return \`\${Math.floor(diff / 3600)}時間前\`;
-      return \`\${Math.floor(diff / 86400)}日前\`;
+    // マーケットデータ取得
+    async function loadMarketData() {
+      if (!selectedItem) return;
+
+      content.innerHTML = '<div class="loading">マーケットデータ読み込み中...</div>';
+
+      // ワールドが選択されている場合はワールド名、データセンターのみの場合はDC名を使用
+      const world = worldSelect.value.trim() || dcSelect.value.trim() || '';
+
+      try {
+        const response = await fetch(\`/api/search?q=\${encodeURIComponent(selectedItem.name)}&world=\${encodeURIComponent(world)}\`);
+        const data = await response.json();
+
+        if (!response.ok) {
+          content.innerHTML = \`<div class="empty-state">\${data.message || 'エラーが発生しました'}</div>\`;
+          return;
+        }
+
+        displayMarketData(data);
+      } catch (error) {
+        content.innerHTML = '<div class="empty-state">通信エラーが発生しました</div>';
+        console.error('Market data error:', error);
+      }
+    }
+
+    // マーケットデータ表示
+    function displayMarketData(data) {
+      const listings = data.listings || [];
+      const recentSales = data.recentHistory || [];
+
+      // 現在選択されているDC/ワールド情報を取得
+      const selectedDC = dcSelect.options[dcSelect.selectedIndex].text;
+      const selectedWorld = worldSelect.options[worldSelect.selectedIndex].text;
+
+      let locationInfo = '';
+      if (worldSelect.value) {
+        // ワールドが選択されている場合
+        const worldObj = worldData.worlds.find(w => w.name === worldSelect.value);
+        locationInfo = worldObj ? \`\${worldObj.dc} - \${worldObj.name}\` : selectedWorld;
+      } else if (dcSelect.value) {
+        // DCのみ選択されている場合
+        locationInfo = \`\${selectedDC} (全ワールド)\`;
+      } else {
+        // 何も選択されていない場合
+        locationInfo = '全エリア';
+      }
+
+      let html = \`
+        <div class="content-header">
+          <div class="content-title">\${escapeHtml(data.itemName)}</div>
+          <div class="content-meta">
+            検索エリア: \${escapeHtml(locationInfo)} | 出品数: \${listings.length}件
+          </div>
+        </div>
+      \`;
+
+      // 出品Top10
+      html += \`
+        <div class="section">
+          <div class="section-title">現在の出品 Top10</div>
+          \${listings.length > 0 ? \`
+            <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>ワールド</th>
+                  <th>価格</th>
+                  <th>数量</th>
+                  <th>品質</th>
+                  <th>合計</th>
+                  <th>リテイナー</th>
+                </tr>
+              </thead>
+              <tbody>
+                \${listings.slice(0, 10).map(l => {
+                  // ワールド名からDCを取得
+                  const worldObj = worldData.worlds.find(w => w.name === l.worldName);
+                  const dcName = worldObj ? worldObj.dc : '';
+                  const worldDisplay = dcName ? \`\${dcName} - \${l.worldName}\` : l.worldName;
+
+                  return \`
+                    <tr>
+                      <td>\${escapeHtml(worldDisplay || '-')}</td>
+                      <td>\${l.price.toLocaleString()} Gil</td>
+                      <td>\${l.quantity}</td>
+                      <td>\${l.hq ? '<span class="badge-hq">HQ</span>' : ''}</td>
+                      <td class="price">\${l.total.toLocaleString()} Gil</td>
+                      <td>\${escapeHtml(l.retainerName || '-')}</td>
+                    </tr>
+                  \`;
+                }).join('')}
+              </tbody>
+            </table>
+            </div>
+          \` : '<div class="empty-state">出品がありません</div>'}
+        </div>
+      \`;
+
+      // 取引履歴Top10
+      html += \`
+        <div class="section">
+          <div class="section-title">過去の取引実績 Top10</div>
+          \${recentSales.length > 0 ? \`
+            <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>ワールド</th>
+                  <th>品質</th>
+                  <th>金額</th>
+                  <th>個数</th>
+                  <th>購入者</th>
+                  <th>購入日</th>
+                </tr>
+              </thead>
+              <tbody>
+                \${recentSales.map(h => {
+                  // ワールド名からDCを取得
+                  const worldObj = worldData.worlds.find(w => w.name === h.worldName);
+                  const dcName = worldObj ? worldObj.dc : '';
+                  const worldDisplay = dcName ? \`\${dcName} - \${h.worldName}\` : h.worldName;
+
+                  // タイムスタンプをフォーマット
+                  const date = new Date(h.timestamp * 1000);
+                  const dateStr = \`\${date.getMonth() + 1}/\${date.getDate()} \${String(date.getHours()).padStart(2, '0')}:\${String(date.getMinutes()).padStart(2, '0')}\`;
+
+                  return \`
+                    <tr>
+                      <td>\${escapeHtml(worldDisplay || '-')}</td>
+                      <td>\${h.hq ? '<span class="badge-hq">HQ</span>' : ''}</td>
+                      <td>\${h.price.toLocaleString()} Gil</td>
+                      <td>\${h.quantity}</td>
+                      <td>\${escapeHtml(h.buyerName || '-')}</td>
+                      <td>\${dateStr}</td>
+                    </tr>
+                  \`;
+                }).join('')}
+              </tbody>
+            </table>
+            </div>
+          \` : '<div class="empty-state">取引履歴がありません</div>'}
+        </div>
+      \`;
+
+      content.innerHTML = html;
     }
 
     function escapeHtml(text) {
       const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
-      return String(text).replace(/[&<>"']/g, m => map[m]);
+      return String(text || '').replace(/[&<>"']/g, m => map[m]);
     }
-
-    // モーダル閉じるボタン
-    document.querySelector('.modal-close').addEventListener('click', closeModal);
   </script>
 </body>
 </html>
