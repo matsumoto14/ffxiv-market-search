@@ -631,6 +631,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <select id="worldSelect">
         <option value="">全ワールド</option>
       </select>
+      <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
+        <input type="checkbox" id="hqOnly" style="cursor: pointer;">
+        <span>HQのみ</span>
+      </label>
     </div>
   </div>
 
@@ -660,6 +664,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     const searchInput = document.getElementById('searchInput');
     const dcSelect = document.getElementById('dcSelect');
     const worldSelect = document.getElementById('worldSelect');
+    const hqOnly = document.getElementById('hqOnly');
     const itemList = document.getElementById('itemList');
     const content = document.getElementById('content');
 
@@ -726,6 +731,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     // ワールド選択時に再検索
     worldSelect.addEventListener('change', () => {
+      if (selectedItem) {
+        loadMarketData();
+      }
+    });
+
+    // HQ絞り込み変更時に再検索
+    hqOnly.addEventListener('change', () => {
       if (selectedItem) {
         loadMarketData();
       }
@@ -829,7 +841,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       // ワールドが選択されている場合はワールド名、データセンターのみの場合はDC名を使用
       const world = worldSelect.value.trim() || dcSelect.value.trim() || '';
-      const apiUrl = \`/api/search?q=\${encodeURIComponent(selectedItem.name)}&world=\${encodeURIComponent(world)}\`;
+      const hq = hqOnly.checked ? 'true' : 'false';
+      const apiUrl = \`/api/search?q=\${encodeURIComponent(selectedItem.name)}&world=\${encodeURIComponent(world)}&hq=\${hq}\`;
       
       console.log('[Frontend] マーケットデータ取得開始:', selectedItem.name, 'world:', world);
       console.log('[Frontend] マーケットデータAPI URL:', apiUrl);
