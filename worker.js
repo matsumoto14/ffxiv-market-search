@@ -121,11 +121,29 @@ async function handleSearch(url) {
                          'Anima', 'Asura', 'Belias', 'Chocobo', 'Hades', 'Ixion', 'Mandragora', 'Masamune', 'Pandaemonium', 'Shinryu', 'Titan'];
 
     const worldTop10 = {};
+    const historyLast3Months = [];
     try {
-      // 各ワールド10件ずつ取得するため、多めに取得（29ワールド × 10件 = 290件）
-      const japanMarketData = await fetchMarketData('Japan', itemResult.id, 500);
+      // 過去3か月分のデータを取得するため、大量のentriesを指定（最大値: 10000程度）
+      const japanMarketData = await fetchMarketData('Japan', itemResult.id, 10000);
       if (japanMarketData && japanMarketData.recentHistory) {
         console.log(`[Search] Japan全体の取引履歴: ${japanMarketData.recentHistory.length}件取得`);
+
+        // 過去3か月の期間を計算（秒単位のUnixタイムスタンプ）
+        const now = Math.floor(Date.now() / 1000);
+        const threeMonthsAgo = now - (90 * 24 * 60 * 60); // 90日前
+
+        // 過去3か月分のデータをフィルタリング
+        const last3MonthsData = japanMarketData.recentHistory.filter(h => h.timestamp >= threeMonthsAgo);
+        console.log(`[Search] 過去3か月分の取引履歴: ${last3MonthsData.length}件`);
+
+        // 過去3か月分のデータを保存（グラフ用）
+        historyLast3Months.push(...last3MonthsData.map(h => ({
+          price: h.pricePerUnit,
+          quantity: h.quantity,
+          hq: h.hq,
+          timestamp: h.timestamp,
+          worldName: h.worldName,
+        })));
 
         // 各ワールドごとに取引履歴を分類してTop10を作成（最新10件を取得）
         japanWorlds.forEach(worldName => {
@@ -174,6 +192,7 @@ async function handleSearch(url) {
         timestamp: h.timestamp,
       })),
       worldTop10: worldTop10,
+      historyLast3Months: historyLast3Months,
       cheapest: paginatedListings.length > 0 ? paginatedListings[0].pricePerUnit : null,
       averagePrice: marketData.averagePrice || null,
       timestamp: Date.now(),
@@ -299,6 +318,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FFXIV マーケット検索</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     * {
       box-sizing: border-box;
@@ -615,6 +635,27 @@ const HTML_CONTENT = `<!DOCTYPE html>
       .badge-hq {
         font-size: 10px;
         padding: 1px 4px;
+      }
+    }
+
+    /* グラフ用スタイル */
+    .chart-container {
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      margin-top: 16px;
+    }
+
+    .chart-wrapper {
+      position: relative;
+      height: 400px;
+      width: 100%;
+    }
+
+    @media (max-width: 768px) {
+      .chart-wrapper {
+        height: 300px;
       }
     }
   </style>
@@ -1109,7 +1150,40 @@ const HTML_CONTENT = `<!DOCTYPE html>
         </div>
       \`;
 
+      // 過去3か月の価格推移グラフセクション
+      if (data.historyLast3Months && data.historyLast3Months.length > 0) {
+        html += \`
+          <div class="section">
+            <div class="section-title">
+              過去3か月の価格推移
+              <div style="display: inline-block; margin-left: 16px; font-size: 12px; font-weight: 400;">
+                <button onclick="updatePriceChart('all')" id="chartBtnAll" style="margin: 0 4px; padding: 4px 8px; font-size: 11px; cursor: pointer; border: 1px solid var(--primary); background: var(--primary); color: white; border-radius: 4px;">全体</button>
+                <button onclick="updatePriceChart('Elemental')" id="chartBtnElemental" style="margin: 0 4px; padding: 4px 8px; font-size: 11px; cursor: pointer; border: 1px solid var(--primary); background: white; color: var(--primary); border-radius: 4px;">Elemental</button>
+                <button onclick="updatePriceChart('Gaia')" id="chartBtnGaia" style="margin: 0 4px; padding: 4px 8px; font-size: 11px; cursor: pointer; border: 1px solid var(--primary); background: white; color: var(--primary); border-radius: 4px;">Gaia</button>
+                <button onclick="updatePriceChart('Mana')" id="chartBtnMana" style="margin: 0 4px; padding: 4px 8px; font-size: 11px; cursor: pointer; border: 1px solid var(--primary); background: white; color: var(--primary); border-radius: 4px;">Mana</button>
+              </div>
+            </div>
+            <div class="chart-container">
+              <div class="chart-wrapper">
+                <canvas id="priceChart"></canvas>
+              </div>
+            </div>
+            <div style="margin-top: 8px; font-size: 12px; color: var(--text-muted); text-align: center;">
+              ※ データセンター単位で日別平均価格を表示｜ボタンをクリックしてDCを切り替え
+            </div>
+          </div>
+        \`;
+      }
+
       content.innerHTML = html;
+
+      // グラフを初期化（データがある場合）
+      if (data.historyLast3Months && data.historyLast3Months.length > 0) {
+        // DOMが更新された後にグラフを初期化
+        setTimeout(() => {
+          initPriceChart(data);
+        }, 100);
+      }
     }
 
     function escapeHtml(text) {
@@ -1123,6 +1197,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
       'Gaia': true,
       'Mana': true
     };
+
+    // グラフ関連のグローバル変数
+    let priceChartInstance = null;
+    let currentMarketData = null;
 
     function toggleDC(dcName) {
       // 状態を反転
@@ -1142,6 +1220,184 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const elements = document.querySelectorAll(\`.dc-\${dcName}\`);
       elements.forEach(el => {
         el.style.display = dcVisibility[dcName] ? '' : 'none';
+      });
+    }
+
+    // グラフ初期化関数
+    function initPriceChart(data) {
+      currentMarketData = data;
+
+      // 既存のグラフがあれば破棄
+      if (priceChartInstance) {
+        priceChartInstance.destroy();
+      }
+
+      // canvas要素を取得
+      const canvas = document.getElementById('priceChart');
+      if (!canvas) return;
+
+      // デフォルトは全体表示
+      updatePriceChart('all');
+    }
+
+    // グラフ更新関数
+    function updatePriceChart(dcFilter) {
+      if (!currentMarketData || !currentMarketData.historyLast3Months) return;
+
+      const dcGroups = {
+        'Elemental': ['Aegis', 'Atomos', 'Carbuncle', 'Garuda', 'Gungnir', 'Kujata', 'Ramuh', 'Tonberry', 'Typhon', 'Unicorn'],
+        'Gaia': ['Alexander', 'Bahamut', 'Durandal', 'Fenrir', 'Ifrit', 'Ridill', 'Tiamat', 'Ultima'],
+        'Mana': ['Anima', 'Asura', 'Belias', 'Chocobo', 'Hades', 'Ixion', 'Mandragora', 'Masamune', 'Pandaemonium', 'Shinryu', 'Titan']
+      };
+
+      // ボタンのスタイルを更新
+      ['all', 'Elemental', 'Gaia', 'Mana'].forEach(dc => {
+        const btnId = dc === 'all' ? 'chartBtnAll' : \`chartBtn\${dc}\`;
+        const btn = document.getElementById(btnId);
+        if (btn) {
+          if (dc === dcFilter) {
+            btn.style.background = 'var(--primary)';
+            btn.style.color = 'white';
+          } else {
+            btn.style.background = 'white';
+            btn.style.color = 'var(--primary)';
+          }
+        }
+      });
+
+      // データをフィルタリング
+      let filteredData = currentMarketData.historyLast3Months;
+      if (dcFilter !== 'all') {
+        const worldsInDC = dcGroups[dcFilter] || [];
+        filteredData = filteredData.filter(h => worldsInDC.includes(h.worldName));
+      }
+
+      // 日別にデータを集計
+      const dailyData = {};
+      filteredData.forEach(h => {
+        const date = new Date(h.timestamp * 1000);
+        const dateKey = \`\${date.getFullYear()}-\${String(date.getMonth() + 1).padStart(2, '0')}-\${String(date.getDate()).padStart(2, '0')}\`;
+
+        if (!dailyData[dateKey]) {
+          dailyData[dateKey] = { prices: [], quantities: [] };
+        }
+        dailyData[dateKey].prices.push(h.price);
+        dailyData[dateKey].quantities.push(h.quantity);
+      });
+
+      // 日付順にソート
+      const sortedDates = Object.keys(dailyData).sort();
+
+      // グラフデータを生成
+      const labels = sortedDates.map(date => {
+        const [y, m, d] = date.split('-');
+        return \`\${m}/\${d}\`;
+      });
+
+      const avgPrices = sortedDates.map(date => {
+        const prices = dailyData[date].prices;
+        return Math.round(prices.reduce((sum, p) => sum + p, 0) / prices.length);
+      });
+
+      const minPrices = sortedDates.map(date => Math.min(...dailyData[date].prices));
+      const maxPrices = sortedDates.map(date => Math.max(...dailyData[date].prices));
+
+      // 既存のグラフがあれば破棄
+      if (priceChartInstance) {
+        priceChartInstance.destroy();
+      }
+
+      // グラフを描画
+      const canvas = document.getElementById('priceChart');
+      if (!canvas) return;
+
+      const ctx = canvas.getContext('2d');
+      priceChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            {
+              label: '平均価格',
+              data: avgPrices,
+              borderColor: 'rgb(59, 130, 246)',
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              borderWidth: 2,
+              pointRadius: 2,
+              pointHoverRadius: 5,
+              tension: 0.1,
+              fill: true
+            },
+            {
+              label: '最低価格',
+              data: minPrices,
+              borderColor: 'rgb(34, 197, 94)',
+              backgroundColor: 'rgba(34, 197, 94, 0.05)',
+              borderWidth: 1.5,
+              pointRadius: 1,
+              pointHoverRadius: 4,
+              tension: 0.1,
+              borderDash: [5, 5]
+            },
+            {
+              label: '最高価格',
+              data: maxPrices,
+              borderColor: 'rgb(239, 68, 68)',
+              backgroundColor: 'rgba(239, 68, 68, 0.05)',
+              borderWidth: 1.5,
+              pointRadius: 1,
+              pointHoverRadius: 4,
+              tension: 0.1,
+              borderDash: [5, 5]
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {
+            mode: 'index',
+            intersect: false,
+          },
+          plugins: {
+            legend: {
+              display: true,
+              position: 'top',
+            },
+            tooltip: {
+              callbacks: {
+                label: function(context) {
+                  return context.dataset.label + ': ' + context.parsed.y.toLocaleString() + ' Gil';
+                }
+              }
+            }
+          },
+          scales: {
+            x: {
+              display: true,
+              title: {
+                display: true,
+                text: '日付'
+              },
+              ticks: {
+                maxRotation: 45,
+                minRotation: 45
+              }
+            },
+            y: {
+              display: true,
+              title: {
+                display: true,
+                text: '価格 (Gil)'
+              },
+              ticks: {
+                callback: function(value) {
+                  return value.toLocaleString();
+                }
+              }
+            }
+          }
+        }
       });
     }
   </script>
